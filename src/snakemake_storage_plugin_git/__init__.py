@@ -1,16 +1,21 @@
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional, List
+from typing import Any, Optional, List
+
+import os
+import pygit2
+from urllib.parse import urlparse
+
 from snakemake_interface_storage_plugins.settings import StorageProviderSettingsBase
 from snakemake_interface_storage_plugins.storage_provider import (  # noqa
     StorageProviderBase,
     StorageQueryValidationResult,
     ExampleQuery,
+    QueryType,
     Operation,
 )
 from snakemake_interface_storage_plugins.storage_object import (
     StorageObjectRead,
     StorageObjectWrite,
-    StorageObjectGlob,
     retry_decorator,
 )
 from snakemake_interface_storage_plugins.io import IOCacheStorageInterface
@@ -20,6 +25,25 @@ from snakemake_interface_storage_plugins.io import IOCacheStorageInterface
 # Snakemake and the user as WorkflowError.
 from snakemake_interface_common.exceptions import WorkflowError  # noqa
 
+class RemoteSSHCallbacks(pygit2.RemoteCallbacks):
+    def __init__(self, username="git", public_key=None, private_key=None, passphrase=""):
+        super().__init__()
+        self.username = username
+        self.public_key = public_key
+        self.private_key = private_key
+        self.passphrase = passphrase
+
+    def credentials(self, url, username_from_url, allowed_types):
+        if allowed_types & pygit2.enums.CredentialType.USERNAME:
+            return pygit2.Username(self.username)
+        if allowed_types & pygit2.enums.CredentialType.SSH_KEY:
+            return pygit2.Keypair(
+                self.username,
+                self.public_key,
+                self.private_key,
+                self.passphrase
+            )
+        return None
 
 # Optional:
 # Define settings for your storage plugin (e.g. host url, credentials).
@@ -33,31 +57,97 @@ from snakemake_interface_common.exceptions import WorkflowError  # noqa
 # settings.
 @dataclass
 class StorageProviderSettings(StorageProviderSettingsBase):
-    myparam: Optional[int] = field(
-        default=None,
+    enable_rate_limits: Optional[bool] = field(
+        default=True,
         metadata={
-            "help": "Some help text",
-            # Optionally request that setting is also available for specification
-            # via an environment variable. The variable will be named automatically as
-            # SNAKEMAKE_<storage-plugin-name>_<param-name>, all upper case.
-            # This mechanism should only be used for passwords, usernames, and other
-            # credentials.
-            # For other items, we rather recommend to let people use a profile
-            # for setting defaults
-            # (https://snakemake.readthedocs.io/en/stable/executing/cli.html#profiles).
+            "help": "Use rate limiting for platforms that require it (e.g. GitHub).",
             "env_var": False,
-            # Optionally specify a function that parses the value given by the user.
-            # This is useful to create complex types from the user input.
-            "parse_func": ...,
-            # If a parse_func is specified, you also have to specify an unparse_func
-            # that converts the parsed value back to a string.
-            "unparse_func": ...,
-            # Optionally specify that setting is required when the executor is in use.
-            "required": True,
-            # Optionally specify multiple args with "nargs": "+"
+            "required": False,
         },
     )
-
+    max_requests_per_second: Optional[float] = field(
+        default=1,
+        metadata={
+            "help": "Maximum number of requests per second for this storage provider. "
+                    "0.01 is recommended for GitHub if many repositories are "
+                    "cloned to avoid exceeding the rate limit.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    local_path_delimiter: Optional[str] = field(
+        default="+",
+        metadata={
+            "help": "Delimiter to replace '/' with in the local path of the cloned repositories.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    fetch_to_update: Optional[bool] = field(
+        default=True,
+        metadata={
+            "help": "Fetch changes from the remote if the repository already exists in local.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    ssh_username: Optional[str] = field(
+        default="git",
+        metadata={
+            "help": "Username for SSH authentication.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    ssh_pubkey_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to the SSH public key for authentication.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    ssh_privkey_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to the SSH private key for authentication.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    ssh_passphrase: Optional[str] = field(
+        default="",
+        metadata={
+            "help": "Passphrase for the SSH private key.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    custom_heads: Optional[dict] = field(
+        default=None,
+        metadata={
+            "help": "Do checkout to a custom branche(or tag) and commit after cloning."
+            "{\"<GIT_URL>\": {\"tag\": \"<TAG>\", \"branch\": \"<BRANCH>\", \"commit\": \"<COMMIT_ID>\"}}",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    keep_local: Optional[bool] = field(
+        default=True,
+        metadata={
+            "help": "Keep the cloned repositories after the workflow is finished.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    ignore_errors: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Ignore errors when cloning or pulling repositories.",
+            "env_var": False,
+            "required": False,
+        },
+    )
 
 # Required:
 # Implementation of your storage provider
@@ -76,13 +166,25 @@ class StorageProvider(StorageProviderBase):
         # This is optional and can be removed if not needed.
         # Alternatively, you can e.g. prepare a connection to your storage backend here.
         # and set additional attributes.
-        pass
+        self.done_queries = set()
+        self.limit_mode = True
 
     @classmethod
     def example_queries(cls) -> List[ExampleQuery]:
         """Return an example queries with description for this storage provider (at
         least one)."""
-        ...
+        return [
+            ExampleQuery(
+                query="https://example.com/repo.git",
+                type=QueryType.INPUT,
+                description="The remote git repository is accessed via HTTPS.",
+            ),
+            ExampleQuery(
+                query="ssh://example.com/repo.git",
+                type=QueryType.INPUT,
+                description="The remote git repository is accessed via SSH."
+            ),
+        ]
 
     def rate_limiter_key(self, query: str, operation: Operation) -> Any:
         """Return a key for identifying a rate limiter given a query and an operation.
@@ -91,16 +193,18 @@ class StorageProvider(StorageProviderBase):
         E.g. for a storage provider like http that would be the host name.
         For s3 it might be just the endpoint URL.
         """
-        ...
+        return urlparse(query).netloc
 
     def default_max_requests_per_second(self) -> float:
         """Return the default maximum number of requests per second for this storage
         provider."""
-        ...
+        return self.settings.max_request_per_sec
 
     def use_rate_limiter(self) -> bool:
         """Return False if no rate limiting is needed for this provider."""
-        ...
+        if not self.settings.enable_rate_limits:
+            return False
+        return self.limit_mode
 
     @classmethod
     def is_valid_query(cls, query: str) -> StorageQueryValidationResult:
@@ -108,7 +212,17 @@ class StorageProvider(StorageProviderBase):
         # Ensure that also queries containing wildcards (e.g. {sample}) are accepted
         # and considered valid. The wildcards will be resolved before the storage
         # object is actually used.
-        ...
+        url_parsed = urlparse(query)
+
+        if url_parsed.scheme not in ["ssh", "https"]:
+            return StorageQueryValidationResult(
+                query=query,
+                valid=False,
+                reason="Only 'ssh', 'https', and 'file' schemes are supported."
+                f"(got '{url_parsed.scheme})'",
+            )
+
+        return StorageQueryValidationResult(valid=True, query=query)
 
     # If required, overwrite the method postprocess_query from StorageProviderBase
     # in order to e.g. normalize the query or add information from the settings to it.
@@ -130,17 +244,7 @@ class StorageProvider(StorageProviderBase):
 # from the list of inherited items.
 # Inside of the object, you can use self.provider to access the provider (e.g. for )
 # self.provider.logger, see above, or self.provider.settings).
-class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
-    # For compatibility with future changes, you should not overwrite the __init__
-    # method. Instead, use __post_init__ to set additional attributes and initialize
-    # futher stuff.
-
-    def __post_init__(self):
-        # This is optional and can be removed if not needed.
-        # Alternatively, you can e.g. prepare a connection to your storage backend here.
-        # and set additional attributes.
-        pass
-
+class StorageObject(StorageObjectRead, StorageObjectWrite):
     async def inventory(self, cache: IOCacheStorageInterface):
         """From this file, try to find as much existence and modification date
         information as possible. Only retrieve that information that comes for free
@@ -152,7 +256,40 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         # the given IOCache object, using self.cache_key() as key.
         # Optionally, this can take a custom local suffix, needed e.g. when you want
         # to cache more items than the current query: self.cache_key(local_suffix=...)
-        pass
+        if self.query in self.provider.done_queries:
+            self.provider.limit_mode = False
+            return
+
+        if os.path.exists(self.local_path()):
+            if self.provider.settings.fetch_to_update:
+                try:
+                    self._pull_repository()
+                except pygit2.GitError as e:
+                    if self.provider.settings.ignore_errors:
+                        self.provider.logger.warning(f"Failed to pull repository: {e}. "
+                                                    "Continuing without pulling.")
+                    else:
+                        raise WorkflowError(f"Failed to pull repository: {e}") from e
+            else:
+                self.provider.limit_mode = False
+        else:
+            try:
+                self._clone_repository()
+            except pygit2.GitError as e:
+                if self.provider.settings.ignore_errors:
+                    self.provider.logger.warning(f"Failed to clone repository: {e}. "
+                                                "Continuing without cloning.")
+                else:
+                    raise WorkflowError(f"Failed to clone repository: {e}") from e
+
+        self.provider.done_queries.add(self.query)
+
+        if os.path.exists(self.local_path()):
+            cache_key = self.cache_key(self.local_path())
+            cache.exists_in_storage[cache_key] = True
+            stat_local_path = os.stat(self.local_path())
+            cache.mtime[cache_key] = stat_local_path.st_mtime
+            cache.size[cache_key] = stat_local_path.st_size
 
     def get_inventory_parent(self) -> Optional[str]:
         """Return the parent directory of this object."""
@@ -161,7 +298,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
 
     def local_suffix(self) -> str:
         """Return a unique suffix for the local path, determined from self.query."""
-        ...
+        return self._get_directory_to_clone()
 
     def cleanup(self):
         """Perform local cleanup of any remainders of the storage object."""
@@ -175,17 +312,22 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     @retry_decorator
     def exists(self) -> bool:
         # return True if the object exists
-        ...
+        return os.path.exists(self.local_path())
 
     @retry_decorator
     def mtime(self) -> float:
         # return the modification time
-        ...
+        # When this method is called, all repositories should already have been cloned
+        # and pulled. So, rate limiter is not needed anymore.
+        self.provider.limit_mode = False
+        return 0
 
     @retry_decorator
     def size(self) -> int:
         # return the size in bytes
-        ...
+        # same as mtime()
+        self.provider.limit_mode = False
+        return 0
 
     @retry_decorator
     def local_footprint(self) -> int:
@@ -213,28 +355,73 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         # self.is_ondemand_eligible is by default set to False.
         ...
 
-    # The following to methods are only required if the class inherits from
-    # StorageObjectReadWrite.
-
     @retry_decorator
     def store_object(self):
         # Ensure that the object is stored at the location specified by
         # self.local_path().
         ...
 
-    @retry_decorator
     def remove(self):
         # Remove the object from the storage.
         ...
 
-    # The following to methods are only required if the class inherits from
-    # StorageObjectGlob.
+    def _get_directory_to_clone(self) -> str:
+        """Return the directory where the repository is cloned."""
+        parsed_query = urlparse(self.query)
+        url_path = parsed_query.path.lstrip("/").removesuffix(".git").replace("/", self.provider.settings.local_path_delimiter)
+        if not url_path:
+            if self.provider.settings.ignore_errors:
+                self.provider.logger.warning(f"The URL path is missing: {self.query}.")
+                return ""
+            else:
+                raise WorkflowError(f"The URL path is missing: {self.query}.")
 
-    @retry_decorator
-    def list_candidate_matches(self) -> Iterable[str]:
-        """Return a list of candidate matches in the storage for the query."""
-        # This is used by glob_wildcards() to find matches for wildcards in the query.
-        # The method has to return concretized queries without any remaining wildcards.
-        # Use snakemake_executor_plugins.io.get_constant_prefix(self.query) to get the
-        # prefix of the query before the first wildcard.
-        ...
+        return f"{parsed_query.netloc}+{url_path}"
+
+    def _clone_repository(self):
+        try:
+            self.provider.logger.info(f"Cloning repository {self.query} to {self.local_path()}")
+            pygit2.clone_repository(self.query, self.local_path(), callbacks=RemoteSSHCallbacks(
+                username=self.provider.settings.ssh_username,
+                public_key=self.provider.settings.ssh_pubkey_path,
+                private_key=self.provider.settings.ssh_privkey_path,
+                passphrase=self.provider.settings.ssh_passphrase,
+            ))
+        except pygit2.GitError as e:
+            raise WorkflowError(f"Failed to clone repository: {e}")
+
+    def _pull_repository(self):
+        try:
+            self.provider.logger.info(f"Pulling repository {self.query} in {self.local_path()}")
+            repo = pygit2.Repository(self.local_path())
+            remote = repo.remotes["origin"]
+            remote.fetch(callbacks=RemoteSSHCallbacks(
+                username=self.provider.settings.ssh_username,
+                public_key=self.provider.settings.ssh_pubkey_path,
+                private_key=self.provider.settings.ssh_privkey_path,
+                passphrase=self.provider.settings.ssh_passphrase,
+            ))
+        except pygit2.GitError as e:
+            raise WorkflowError(f"Failed to pull repository: {e}")
+
+        if self.query in self.provider.settings.custom_heads:
+            custom_head = self.provider.settings.custom_heads[self.query]
+            tag = custom_head.get("tag", None)
+            branch = custom_head.get("branch", None)
+            commit_id = custom_head.get("commit", None)
+            commit = None
+            self.provider.logger.info(f"Checking out custom head for {self.query}: "
+                                        f"tag={tag}, branch={branch}, commit_id={commit_id}")
+            if tag:
+                commit = repo.revparse_single(f"refs/tags/{tag}")
+                repo.set_head(commit.id)
+            elif commit_id:
+                commit = repo.revparse_single(commit_id)
+                repo.set_head(commit.id)
+            elif branch:
+                commit = repo.revparse_single(f"refs/heads/{branch}")
+                repo.set_head(f"refs/heads/{branch}")
+            else:
+                commit = repo.head.peel()
+
+            repo.checkout_tree(commit, strategy=pygit2.GIT_CHECKOUT_FORCE)
