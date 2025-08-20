@@ -18,6 +18,7 @@ email = "hyeokjin.kwon@uni-potsdam.de"
 [project.urls]
 repository = "https://github.com/SE-UP/snakemake-storage-plugin-git"
 homepage   = "https://snakemake.github.io/snakemake-plugin-catalog/"
+Documentation = "https://snakemake.github.io/snakemake-plugin-catalog/plugins/storage/git.html"
 
 [build-system]
 build-backend = "hatchling.build"
@@ -25,10 +26,6 @@ requires = [ "hatchling",]
 
 [dependency-groups]
 dev = [ "ruff", "coverage", "pytest", "twine", "python-build",]
-
-[project.urls]
-Repository = "https://github.com/your/plugin"
-Documentation = "https://snakemake.github.io/snakemake-plugin-catalog/plugins/storage/git.html"
 
 [tool.pixi.workspace]
 channels = [ "conda-forge",]
