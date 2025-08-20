@@ -50,3 +50,4 @@ check-build = { cmd = "python -m twine check dist/*", depends-on = ["build"] }
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.1"
 snakemake = "^9.1.0"
+ruff="^0.12.9"
