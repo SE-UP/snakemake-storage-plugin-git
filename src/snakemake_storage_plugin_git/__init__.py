@@ -2,8 +2,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, List
 
 import os
-import pygit2
 from urllib.parse import urlparse
+import pygit2
 
 from snakemake_interface_storage_plugins.settings import StorageProviderSettingsBase
 from snakemake_interface_storage_plugins.storage_provider import (  # noqa
@@ -18,12 +18,12 @@ from snakemake_interface_storage_plugins.storage_object import (
     StorageObjectWrite,
     retry_decorator,
 )
-from snakemake_interface_storage_plugins.io import IOCacheStorageInterface
-
+from snakemake_interface_storage_plugins.io import IOCacheStorageInterface, Mtime
 
 # Raise errors that will not be handled within this plugin but thrown upwards to
 # Snakemake and the user as WorkflowError.
 from snakemake_interface_common.exceptions import WorkflowError  # noqa
+
 
 class RemoteSSHCallbacks(pygit2.RemoteCallbacks):
     def __init__(self, username="git", public_key=None, private_key=None, passphrase=""):
@@ -43,7 +43,17 @@ class RemoteSSHCallbacks(pygit2.RemoteCallbacks):
                 self.private_key,
                 self.passphrase
             )
-        return None
+        raise ValueError("Unsupported credential type or the remote "
+                         "repository is not accessible.")
+
+
+def error_handler(logger: Any, msg: str, ignore: bool, e: Exception):
+    """Handle errors whether to ignore or raise an exception."""
+    if ignore:
+        logger.warning(f"{msg}: {e}.")
+    else:
+        raise WorkflowError(f"{msg}: {e}") from e
+
 
 # Optional:
 # Define settings for your storage plugin (e.g. host url, credentials).
@@ -78,7 +88,8 @@ class StorageProviderSettings(StorageProviderSettingsBase):
     local_path_delimiter: Optional[str] = field(
         default="+",
         metadata={
-            "help": "Delimiter to replace '/' with in the local path of the cloned repositories.",
+            "help": "Delimiter to replace '/' with in the local path of "
+                    "the cloned repositories.",
             "env_var": False,
             "required": False,
         },
@@ -86,7 +97,8 @@ class StorageProviderSettings(StorageProviderSettingsBase):
     fetch_to_update: Optional[bool] = field(
         default=True,
         metadata={
-            "help": "Fetch changes from the remote if the repository already exists in local.",
+            "help": "Fetch changes from the remote if the repository already "
+                    "exists in local.",
             "env_var": False,
             "required": False,
         },
@@ -100,7 +112,7 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         },
     )
     ssh_pubkey_path: Optional[str] = field(
-        default=None,
+        default="/dev/null",
         metadata={
             "help": "Path to the SSH public key for authentication.",
             "env_var": False,
@@ -108,7 +120,7 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         },
     )
     ssh_privkey_path: Optional[str] = field(
-        default=None,
+        default="/dev/null",
         metadata={
             "help": "Path to the SSH private key for authentication.",
             "env_var": False,
@@ -127,7 +139,8 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default=None,
         metadata={
             "help": "Do checkout to a custom branche(or tag) and commit after cloning."
-            "{\"<GIT_URL>\": {\"tag\": \"<TAG>\", \"branch\": \"<BRANCH>\", \"commit\": \"<COMMIT_ID>\"}}",
+                    "{\"<GIT_URL>\": {\"tag\": \"<TAG>\", \"branch\": "
+                    "\"<BRANCH>\", \"commit\": \"<COMMIT_ID>\"}}",
             "env_var": False,
             "required": False,
         },
@@ -143,11 +156,31 @@ class StorageProviderSettings(StorageProviderSettingsBase):
     ignore_errors: Optional[bool] = field(
         default=False,
         metadata={
-            "help": "Ignore errors when cloning or pulling repositories.",
+            "help": "Ignore errors when cloning or pulling repositories. "
+                    "This is useful to keep continuing cloning or pulling "
+                    "repositories even if some of them fail.",
             "env_var": False,
             "required": False,
         },
     )
+    retrieve: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "This value should always be Flase, as this storage provider "
+                    "does not support retrieving objects. ",
+            "env_var": False,
+            "required": False,
+        },
+    )
+    _is_test: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "This is only used for unit tests.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+
 
 # Required:
 # Implementation of your storage provider
@@ -198,7 +231,7 @@ class StorageProvider(StorageProviderBase):
     def default_max_requests_per_second(self) -> float:
         """Return the default maximum number of requests per second for this storage
         provider."""
-        return self.settings.max_request_per_sec
+        return self.settings.max_requests_per_second
 
     def use_rate_limiter(self) -> bool:
         """Return False if no rate limiting is needed for this provider."""
@@ -256,40 +289,14 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
         # the given IOCache object, using self.cache_key() as key.
         # Optionally, this can take a custom local suffix, needed e.g. when you want
         # to cache more items than the current query: self.cache_key(local_suffix=...)
-        if self.query in self.provider.done_queries:
-            self.provider.limit_mode = False
-            return
+        self._clone_or_pull()
 
         if os.path.exists(self.local_path()):
-            if self.provider.settings.fetch_to_update:
-                try:
-                    self._pull_repository()
-                except pygit2.GitError as e:
-                    if self.provider.settings.ignore_errors:
-                        self.provider.logger.warning(f"Failed to pull repository: {e}. "
-                                                    "Continuing without pulling.")
-                    else:
-                        raise WorkflowError(f"Failed to pull repository: {e}") from e
-            else:
-                self.provider.limit_mode = False
-        else:
-            try:
-                self._clone_repository()
-            except pygit2.GitError as e:
-                if self.provider.settings.ignore_errors:
-                    self.provider.logger.warning(f"Failed to clone repository: {e}. "
-                                                "Continuing without cloning.")
-                else:
-                    raise WorkflowError(f"Failed to clone repository: {e}") from e
-
-        self.provider.done_queries.add(self.query)
-
-        if os.path.exists(self.local_path()):
-            cache_key = self.cache_key(self.local_path())
+            cache_key = self.cache_key(str(self.local_path()))
             cache.exists_in_storage[cache_key] = True
-            stat_local_path = os.stat(self.local_path())
-            cache.mtime[cache_key] = stat_local_path.st_mtime
-            cache.size[cache_key] = stat_local_path.st_size
+            stat_info = os.stat(self.local_path())
+            cache.mtime[cache_key] = Mtime(storage=stat_info.st_mtime)
+            cache.size[cache_key] = stat_info.st_size
 
     def get_inventory_parent(self) -> Optional[str]:
         """Return the parent directory of this object."""
@@ -304,7 +311,6 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
         """Perform local cleanup of any remainders of the storage object."""
         # self.local_path() should not be removed, as this is taken care of by
         # Snakemake.
-        ...
 
     # Fallible methods should implement some retry logic.
     # The easiest way to do this (but not the only one) is to use the retry_decorator
@@ -312,6 +318,8 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
     @retry_decorator
     def exists(self) -> bool:
         # return True if the object exists
+        if hasattr(self.provider.settings, "_is_test") and self.provider.settings._is_test:
+            self._clone_or_pull()
         return os.path.exists(self.local_path())
 
     @retry_decorator
@@ -355,6 +363,9 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
         # self.is_ondemand_eligible is by default set to False.
         ...
 
+    # The following to methods are only required if the class inherits from
+    # StorageObjectReadWrite.
+
     @retry_decorator
     def store_object(self):
         # Ensure that the object is stored at the location specified by
@@ -362,35 +373,66 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
         ...
 
     def remove(self):
-        # Remove the object from the storage.
+        # Remove the object from the storage. This method is still needed as
+        # Snakemake calls this when keep_local is set to False.
         ...
 
     def _get_directory_to_clone(self) -> str:
         """Return the directory where the repository is cloned."""
         parsed_query = urlparse(self.query)
-        url_path = parsed_query.path.lstrip("/").removesuffix(".git").replace("/", self.provider.settings.local_path_delimiter)
+        url_path = parsed_query.path.lstrip("/").removesuffix(".git")
+        url_path = url_path.replace("/", self.provider.settings.local_path_delimiter)
         if not url_path:
-            if self.provider.settings.ignore_errors:
-                self.provider.logger.warning(f"The URL path is missing: {self.query}.")
-                return ""
-            else:
-                raise WorkflowError(f"The URL path is missing: {self.query}.")
+            raise WorkflowError(f"The URL path is missing: {self.query}.")
 
         return f"{parsed_query.netloc}+{url_path}"
 
+    def _clone_or_pull(self):
+        if self.query in self.provider.done_queries:
+            self.provider.limit_mode = False
+            return
+
+        if os.path.exists(self.local_path()):
+            if self.provider.settings.fetch_to_update:
+                try:
+                    self._pull_repository()
+                except pygit2.GitError as e:
+                    error_handler(self.provider.logger,
+                                  "Failed to pull repository",
+                                  self.provider.settings.ignore_errors, e)
+            else:
+                self.provider.limit_mode = False
+        else:
+            try:
+                self._clone_repository()
+            except pygit2.GitError as e:
+                error_handler(self.provider.logger,
+                              "Failed to clone repository",
+                              self.provider.settings.ignore_errors, e)
+
+        self.provider.done_queries.add(self.query)
+
     def _clone_repository(self):
         try:
-            self.provider.logger.info(f"Cloning repository {self.query} to {self.local_path()}")
-            pygit2.clone_repository(self.query, self.local_path(), callbacks=RemoteSSHCallbacks(
+            self.provider.logger.info(f"Cloning {self.query} to {self.local_path()}")
+            repo = pygit2.clone_repository(self.query, self.local_path(), callbacks=RemoteSSHCallbacks(
                 username=self.provider.settings.ssh_username,
                 public_key=self.provider.settings.ssh_pubkey_path,
                 private_key=self.provider.settings.ssh_privkey_path,
                 passphrase=self.provider.settings.ssh_passphrase,
             ))
+            self._check_no_default_branch(repo)
         except pygit2.GitError as e:
-            raise WorkflowError(f"Failed to clone repository: {e}")
+            error_handler(self.provider.logger,
+                          "Failed to clone repository",
+                          self.provider.settings.ignore_errors, e)
+        except Exception as e:
+            error_handler(self.provider.logger,
+                          "An unexpected error occurred while cloning",
+                          self.provider.settings.ignore_errors, e)
 
     def _pull_repository(self):
+        repo = None
         try:
             self.provider.logger.info(f"Pulling repository {self.query} in {self.local_path()}")
             repo = pygit2.Repository(self.local_path())
@@ -402,26 +444,80 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
                 passphrase=self.provider.settings.ssh_passphrase,
             ))
         except pygit2.GitError as e:
-            raise WorkflowError(f"Failed to pull repository: {e}")
+            error_handler(self.provider.logger,
+                          "Failed to pull repository",
+                          self.provider.settings.ignore_errors, e)
+        except Exception as e:
+            error_handler(self.provider.logger,
+                          "An unexpected error occurred while pulling",
+                          self.provider.settings.ignore_errors, e)
+
+        if repo and hasattr(self.provider.settings, 'custom_heads'):
+            self._checkout_custom_head(repo)
+
+    def _checkout_custom_head(self, repo):
+        if not self.provider.settings.custom_heads:
+            return
 
         if self.query in self.provider.settings.custom_heads:
             custom_head = self.provider.settings.custom_heads[self.query]
-            tag = custom_head.get("tag", None)
-            branch = custom_head.get("branch", None)
-            commit_id = custom_head.get("commit", None)
-            commit = None
-            self.provider.logger.info(f"Checking out custom head for {self.query}: "
-                                        f"tag={tag}, branch={branch}, commit_id={commit_id}")
-            if tag:
-                commit = repo.revparse_single(f"refs/tags/{tag}")
-                repo.set_head(commit.id)
-            elif commit_id:
-                commit = repo.revparse_single(commit_id)
-                repo.set_head(commit.id)
-            elif branch:
-                commit = repo.revparse_single(f"refs/heads/{branch}")
-                repo.set_head(f"refs/heads/{branch}")
-            else:
-                commit = repo.head.peel()
+            try:
+                tag = custom_head.get("tag", None)
+                branch = custom_head.get("branch", None)
+                commit_id = custom_head.get("commit", None)
+                commit = None
+                self.provider.logger.info(f"Checking out custom head for {self.query}: "
+                                            f"tag={tag}, branch={branch}, commit_id={commit_id}")
+                if tag:
+                    commit = repo.revparse_single(f"refs/tags/{tag}")
+                    repo.set_head(commit.id)
+                elif commit_id:
+                    commit = repo.revparse_single(commit_id)
+                    repo.set_head(commit.id)
+                elif branch:
+                    commit = repo.revparse_single(f"refs/heads/{branch}")
+                    repo.set_head(f"refs/heads/{branch}")
+                else:
+                    commit = repo.head.peel()
 
+                repo.checkout_tree(commit, strategy=pygit2.GIT_CHECKOUT_FORCE)
+            except pygit2.GitError as e:
+                error_handler(self.provider.logger,
+                              "Failed to checkout custom head",
+                              self.provider.settings.ignore_errors, e)
+            except Exception as e:
+                error_handler(self.provider.logger,
+                              "An unexpected error occurred while "
+                              "checking out custom head",
+                              self.provider.settings.ignore_errors, e)
+
+    def _check_no_default_branch(self, repo: pygit2.Repository):
+        """Check if the repository has no default branch."""
+        if not repo.head_is_unborn:
+            return
+
+        self.provider.logger.warning(f"The repository {self.query} has no default branch.")
+        first_remote_branch = None
+        for ref in repo.references:
+            if ref.startswith("refs/remotes/origin/"):
+                first_remote_branch = ref
+                break
+
+        if first_remote_branch is None:
+            error_handler(self.provider.logger,
+                          "No remote branches found in the repository",
+                          self.provider.settings.ignore_errors,
+                          Exception("No refs/remotes/origin/* found."))
+
+        self.provider.logger.info(f"Checking out the first remote branch: {first_remote_branch}")
+
+        try:
+            repo.set_head(first_remote_branch)
+            commit = repo.revparse_single(first_remote_branch)
             repo.checkout_tree(commit, strategy=pygit2.GIT_CHECKOUT_FORCE)
+        except pygit2.GitError as e:
+            error_handler(self.provider.logger,
+                          "Failed to checkout the first remote branch",
+                          self.provider.settings.ignore_errors, e)
+
+        return
