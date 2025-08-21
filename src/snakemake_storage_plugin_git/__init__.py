@@ -26,7 +26,9 @@ from snakemake_interface_common.exceptions import WorkflowError  # noqa
 
 
 class RemoteSSHCallbacks(pygit2.RemoteCallbacks):
-    def __init__(self, username="git", public_key=None, private_key=None, passphrase=""):
+    def __init__(
+        self, username="git", public_key=None, private_key=None, passphrase=""
+    ):
         super().__init__()
         self.username = username
         self.public_key = public_key
@@ -38,13 +40,11 @@ class RemoteSSHCallbacks(pygit2.RemoteCallbacks):
             return pygit2.Username(self.username)
         if allowed_types & pygit2.enums.CredentialType.SSH_KEY:
             return pygit2.Keypair(
-                self.username,
-                self.public_key,
-                self.private_key,
-                self.passphrase
+                self.username, self.public_key, self.private_key, self.passphrase
             )
-        raise ValueError("Unsupported credential type or the remote "
-                         "repository is not accessible.")
+        raise ValueError(
+            "Unsupported credential type or the remote repository is not accessible."
+        )
 
 
 def error_handler(logger: Any, msg: str, ignore: bool, e: Exception):
@@ -79,8 +79,8 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default=1,
         metadata={
             "help": "Maximum number of requests per second for this storage provider. "
-                    "0.01 is recommended for GitHub if many repositories are "
-                    "cloned to avoid exceeding the rate limit.",
+            "0.01 is recommended for GitHub if many repositories are "
+            "cloned to avoid exceeding the rate limit.",
             "env_var": False,
             "required": False,
         },
@@ -89,7 +89,7 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default="+",
         metadata={
             "help": "Delimiter to replace '/' with in the local path of "
-                    "the cloned repositories.",
+            "the cloned repositories.",
             "env_var": False,
             "required": False,
         },
@@ -98,7 +98,7 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default=True,
         metadata={
             "help": "Fetch changes from the remote if the repository already "
-                    "exists in local.",
+            "exists in local.",
             "env_var": False,
             "required": False,
         },
@@ -139,8 +139,8 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default=None,
         metadata={
             "help": "Do checkout to a custom branche(or tag) and commit after cloning."
-                    "{\"<GIT_URL>\": {\"tag\": \"<TAG>\", \"branch\": "
-                    "\"<BRANCH>\", \"commit\": \"<COMMIT_ID>\"}}",
+            '{"<GIT_URL>": {"tag": "<TAG>", "branch": '
+            '"<BRANCH>", "commit": "<COMMIT_ID>"}}',
             "env_var": False,
             "required": False,
         },
@@ -157,8 +157,8 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default=False,
         metadata={
             "help": "Ignore errors when cloning or pulling repositories. "
-                    "This is useful to keep continuing cloning or pulling "
-                    "repositories even if some of them fail.",
+            "This is useful to keep continuing cloning or pulling "
+            "repositories even if some of them fail.",
             "env_var": False,
             "required": False,
         },
@@ -167,7 +167,7 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default=False,
         metadata={
             "help": "This value should always be Flase, as this storage provider "
-                    "does not support retrieving objects. ",
+            "does not support retrieving objects. ",
             "env_var": False,
             "required": False,
         },
@@ -215,7 +215,7 @@ class StorageProvider(StorageProviderBase):
             ExampleQuery(
                 query="ssh://example.com/repo.git",
                 type=QueryType.INPUT,
-                description="The remote git repository is accessed via SSH."
+                description="The remote git repository is accessed via SSH.",
             ),
         ]
 
@@ -318,7 +318,10 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
     @retry_decorator
     def exists(self) -> bool:
         # return True if the object exists
-        if hasattr(self.provider.settings, "_is_test") and self.provider.settings._is_test:
+        if (
+            hasattr(self.provider.settings, "_is_test")
+            and self.provider.settings._is_test
+        ):
             self._clone_or_pull()
         return os.path.exists(self.local_path())
 
@@ -397,62 +400,88 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
                 try:
                     self._pull_repository()
                 except pygit2.GitError as e:
-                    error_handler(self.provider.logger,
-                                  "Failed to pull repository",
-                                  self.provider.settings.ignore_errors, e)
+                    error_handler(
+                        self.provider.logger,
+                        "Failed to pull repository",
+                        self.provider.settings.ignore_errors,
+                        e,
+                    )
             else:
                 self.provider.limit_mode = False
         else:
             try:
                 self._clone_repository()
             except pygit2.GitError as e:
-                error_handler(self.provider.logger,
-                              "Failed to clone repository",
-                              self.provider.settings.ignore_errors, e)
+                error_handler(
+                    self.provider.logger,
+                    "Failed to clone repository",
+                    self.provider.settings.ignore_errors,
+                    e,
+                )
 
         self.provider.done_queries.add(self.query)
 
     def _clone_repository(self):
         try:
             self.provider.logger.info(f"Cloning {self.query} to {self.local_path()}")
-            repo = pygit2.clone_repository(self.query, self.local_path(), callbacks=RemoteSSHCallbacks(
-                username=self.provider.settings.ssh_username,
-                public_key=self.provider.settings.ssh_pubkey_path,
-                private_key=self.provider.settings.ssh_privkey_path,
-                passphrase=self.provider.settings.ssh_passphrase,
-            ))
+            repo = pygit2.clone_repository(
+                self.query,
+                self.local_path(),
+                callbacks=RemoteSSHCallbacks(
+                    username=self.provider.settings.ssh_username,
+                    public_key=self.provider.settings.ssh_pubkey_path,
+                    private_key=self.provider.settings.ssh_privkey_path,
+                    passphrase=self.provider.settings.ssh_passphrase,
+                ),
+            )
             self._check_no_default_branch(repo)
         except pygit2.GitError as e:
-            error_handler(self.provider.logger,
-                          "Failed to clone repository",
-                          self.provider.settings.ignore_errors, e)
+            error_handler(
+                self.provider.logger,
+                "Failed to clone repository",
+                self.provider.settings.ignore_errors,
+                e,
+            )
         except Exception as e:
-            error_handler(self.provider.logger,
-                          "An unexpected error occurred while cloning",
-                          self.provider.settings.ignore_errors, e)
+            error_handler(
+                self.provider.logger,
+                "An unexpected error occurred while cloning",
+                self.provider.settings.ignore_errors,
+                e,
+            )
 
     def _pull_repository(self):
         repo = None
         try:
-            self.provider.logger.info(f"Pulling repository {self.query} in {self.local_path()}")
+            self.provider.logger.info(
+                f"Pulling repository {self.query} in {self.local_path()}"
+            )
             repo = pygit2.Repository(self.local_path())
             remote = repo.remotes["origin"]
-            remote.fetch(callbacks=RemoteSSHCallbacks(
-                username=self.provider.settings.ssh_username,
-                public_key=self.provider.settings.ssh_pubkey_path,
-                private_key=self.provider.settings.ssh_privkey_path,
-                passphrase=self.provider.settings.ssh_passphrase,
-            ))
+            remote.fetch(
+                callbacks=RemoteSSHCallbacks(
+                    username=self.provider.settings.ssh_username,
+                    public_key=self.provider.settings.ssh_pubkey_path,
+                    private_key=self.provider.settings.ssh_privkey_path,
+                    passphrase=self.provider.settings.ssh_passphrase,
+                )
+            )
         except pygit2.GitError as e:
-            error_handler(self.provider.logger,
-                          "Failed to pull repository",
-                          self.provider.settings.ignore_errors, e)
+            error_handler(
+                self.provider.logger,
+                "Failed to pull repository",
+                self.provider.settings.ignore_errors,
+                e,
+            )
         except Exception as e:
-            error_handler(self.provider.logger,
-                          "An unexpected error occurred while pulling",
-                          self.provider.settings.ignore_errors, e)
+            error_handler(
+                self.provider.logger,
+                "An unexpected error occurred while pulling",
+                self.provider.settings.ignore_errors,
+                e,
+            )
 
-        if repo and hasattr(self.provider.settings, 'custom_heads'):
+        if repo and hasattr(self.provider.settings, "custom_heads"):
             self._checkout_custom_head(repo)
 
     def _checkout_custom_head(self, repo):
@@ -466,8 +495,10 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
                 branch = custom_head.get("branch", None)
                 commit_id = custom_head.get("commit", None)
                 commit = None
-                self.provider.logger.info(f"Checking out custom head for {self.query}: "
-                                            f"tag={tag}, branch={branch}, commit_id={commit_id}")
+                self.provider.logger.info(
+                    f"Checking out custom head for {self.query}: "
+                    f"tag={tag}, branch={branch}, commit_id={commit_id}"
+                )
                 if tag:
                     commit = repo.revparse_single(f"refs/tags/{tag}")
                     repo.set_head(commit.id)
@@ -482,21 +513,28 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
 
                 repo.checkout_tree(commit, strategy=pygit2.GIT_CHECKOUT_FORCE)
             except pygit2.GitError as e:
-                error_handler(self.provider.logger,
-                              "Failed to checkout custom head",
-                              self.provider.settings.ignore_errors, e)
+                error_handler(
+                    self.provider.logger,
+                    "Failed to checkout custom head",
+                    self.provider.settings.ignore_errors,
+                    e,
+                )
             except Exception as e:
-                error_handler(self.provider.logger,
-                              "An unexpected error occurred while "
-                              "checking out custom head",
-                              self.provider.settings.ignore_errors, e)
+                error_handler(
+                    self.provider.logger,
+                    "An unexpected error occurred while checking out custom head",
+                    self.provider.settings.ignore_errors,
+                    e,
+                )
 
     def _check_no_default_branch(self, repo: pygit2.Repository):
         """Check if the repository has no default branch."""
         if not repo.head_is_unborn:
             return
 
-        self.provider.logger.warning(f"The repository {self.query} has no default branch.")
+        self.provider.logger.warning(
+            f"The repository {self.query} has no default branch."
+        )
         first_remote_branch = None
         for ref in repo.references:
             if ref.startswith("refs/remotes/origin/"):
@@ -504,20 +542,27 @@ class StorageObject(StorageObjectRead, StorageObjectWrite):
                 break
 
         if first_remote_branch is None:
-            error_handler(self.provider.logger,
-                          "No remote branches found in the repository",
-                          self.provider.settings.ignore_errors,
-                          Exception("No refs/remotes/origin/* found."))
+            error_handler(
+                self.provider.logger,
+                "No remote branches found in the repository",
+                self.provider.settings.ignore_errors,
+                Exception("No refs/remotes/origin/* found."),
+            )
 
-        self.provider.logger.info(f"Checking out the first remote branch: {first_remote_branch}")
+        self.provider.logger.info(
+            f"Checking out the first remote branch: {first_remote_branch}"
+        )
 
         try:
             repo.set_head(first_remote_branch)
             commit = repo.revparse_single(first_remote_branch)
             repo.checkout_tree(commit, strategy=pygit2.GIT_CHECKOUT_FORCE)
         except pygit2.GitError as e:
-            error_handler(self.provider.logger,
-                          "Failed to checkout the first remote branch",
-                          self.provider.settings.ignore_errors, e)
+            error_handler(
+                self.provider.logger,
+                "Failed to checkout the first remote branch",
+                self.provider.settings.ignore_errors,
+                e,
+            )
 
         return
