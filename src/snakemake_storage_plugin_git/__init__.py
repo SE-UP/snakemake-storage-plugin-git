@@ -208,12 +208,12 @@ class StorageProvider(StorageProviderBase):
         least one)."""
         return [
             ExampleQuery(
-                query="https://example.com/repo.git",
+                query="git+https://example.com/repo.git",
                 type=QueryType.INPUT,
                 description="The remote git repository is accessed via HTTPS.",
             ),
             ExampleQuery(
-                query="ssh://example.com/repo.git",
+                query="git+ssh://example.com/repo.git",
                 type=QueryType.INPUT,
                 description="The remote git repository is accessed via SSH.",
             ),
@@ -247,7 +247,7 @@ class StorageProvider(StorageProviderBase):
         # object is actually used.
         url_parsed = urlparse(query)
 
-        if url_parsed.scheme not in ["ssh", "https"]:
+        if url_parsed.scheme not in ["git+ssh", "git+https"]:
             return StorageQueryValidationResult(
                 query=query,
                 valid=False,
